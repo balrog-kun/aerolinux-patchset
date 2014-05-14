@@ -1,0 +1,527 @@
+From db31ab429d92945d00992ce8cfbb883c9696d30d Mon Sep 17 00:00:00 2001
+From: Andrzej Zaborowski <andrew.zaborowski@intel.com>
+Date: Wed, 14 May 2014 09:20:05 +0200
+Subject: [PATCH] GPIO-based driver for RC-hobbies radio receivers.
+
+This does naive interpretation of a PPM signal from an RC-hobbies radio
+system by watching the timestamps level transitions on the ppm signal
+pin ("sum signal").  In other words it does the reverse of bitbanging.
+
+A more clever driver would use the SoC peripherals, if available, to
+automatically capture the timings of edges on the pin, unfortunately
+only some SoCs support it and it doesn't seem any Linux API exists.
+
+With this driver on a 454MHz ARM chip there is notable noise in the
+readings based on edge interrupt timestamps.  The PREEMPT_RT patch may
+help here.
+
+Signed-off-by: Andrzej Zaborowski <andrew.zaborowski@intel.com>
+---
+ drivers/input/misc/Kconfig      |  26 +++
+ drivers/input/misc/Makefile     |   1 +
+ drivers/input/misc/generic-rx.c | 449 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 476 insertions(+)
+ create mode 100644 drivers/input/misc/generic-rx.c
+
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 7904ab0..ed16b94 100644
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -666,4 +666,30 @@ config INPUT_IDEAPAD_SLIDEBAR
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called ideapad_slidebar.
+ 
++config INPUT_GENERIC_RX
++	tristate "RC-hobbies receiver support over GPIO"
++	depends on GPIO_GENERIC
++	help
++	  Say M here if you intend to connect the PPM "sum signal" from
++	  an RC-hobbies radio receiver to a GPIO in your system.  Many,
++	  but not all, receivers have this signal broken out on one of
++	  the pins and it can be interpreted to read live values on each
++	  channel (stick axis, button, switch or knob).  Some of those
++	  receivers that don't expose this signal can also be supported
++	  with minor changes in the code.
++
++	  Use the module's "gpio" parameter to pass the id of the GPIO
++	  pin receiving the sum signal to the driver.  Make sure there
++	  is a clocksource of at least ~250kHz resolution enabled in
++	  the system (you may need to make your scripts select a
++	  clocksource by writing to
++	  /sys/bus/clocksource/devices/clocksource0/current_clocksource
++	  before modprobing this module), otherwise the values that
++	  the driver will report will be of proportionally lower
++	  resolution as well.
++
++	  The driver can also be built into the kernel but for the
++	  reasons mentioned it will be more practical to use it as a
++	  module.
++
+ endif
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+index cda71fc..6f5435e 100644
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -63,3 +63,4 @@ obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x-on.o
+ obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
+ obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
+ obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
++obj-$(CONFIG_INPUT_GENERIC_RX)		+= generic-rx.o
+diff --git a/drivers/input/misc/generic-rx.c b/drivers/input/misc/generic-rx.c
+new file mode 100644
+index 0000000..79fa65c
+--- /dev/null
++++ b/drivers/input/misc/generic-rx.c
+@@ -0,0 +1,449 @@
++/*
++ * Generic RC-hobbies radio receiver driver.
++ *
++ * This file is subject to the terms and conditions of the GNU General
++ * Public License. See the file "COPYING" in the main directory of this
++ * archive for more details.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/time.h>
++#include <linux/hrtimer.h>
++#include <linux/interrupt.h>
++#include <linux/gpio/consumer.h>
++#include <linux/gpio.h>
++#include <linux/miscdevice.h>
++#include <linux/rwlock.h>
++#include <linux/poll.h>
++
++/*
++ * This driver supports basic RC-hobbies radio receivers which have a
++ * "sum signal" output pin.  The driver uses a configurable GPIO pin to
++ * watch the sum signal and demultiplex the radio channels into input
++ * events.
++ *
++ * Many RC receivers on the market, both basic and advanced, both short
++ * and long range, 4- to 10-channel, expose the sum signal
++ * on one of the pins.
++ *
++ * Some receivers, like some E-Sky kit ones have no sum signal but 3
++ * GPIOs can be used to read all of the channels because a falling edge
++ * on one channel always coincides with a rising edge on the consecutive
++ * pin.  Support for those receivers may be added.  A simple analog or
++ * PWM-based RSSI signal support is also planned.
++ */
++
++/* Parameters that can be passed to the driver. */
++
++/* The GPIO pin to watch */
++static int gpio;
++module_param(gpio, int, 0444);
++MODULE_PARM_DESC(gpio, "Sum-signal input GPIO number");
++
++/* The level transition to use as pulse end marker */
++static char *edge = "falling";
++module_param(edge, charp, 0444);
++MODULE_PARM_DESC(edge, "Pulse edge to use as marker (falling, rising, both)");
++
++/*
++ * Let the user decide to reduce the latency for the initial N channels
++ * and slightly increase latency for the remaining channels if the inital
++ * channels are considered more critical.  This is often the case if the
++ * first 4 channels contain the stick input.  If low_channels is set to
++ * 4, the batch of new values will be submitted to userspace after the
++ * 4th pulse is received instead of waiting for a full round which may
++ * save the user some 15ms waiting.  The report will contain the remaining
++ * channel values from the previous cycle.
++ */
++static int low_channels;
++module_param(low_channels, int, 0444);
++MODULE_PARM_DESC(low_channels, "Report as soon as Nth channel pulse received");
++
++/*
++ * Ignore out of range pulse widths for channels N and higher (N is
++ * 0-based).  For example the RMILEC UHF receivers configured for 6ch
++ * will send a 2.5ms and a 0.5ms pulse as channel 7 and 8, in which
++ * case garbage_channels=6 will save the reading from being rejected
++ * as invalid.
++ */
++static int garbage_channels = 6;
++module_param(garbage_channels, int, 0444);
++MODULE_PARM_DESC(garbage_channels, "Ignore out-of-range pulses for channels N+"
++		" (0-based)");
++
++/*
++ * By default don't submit new evdev events for each single channel as
++ * that would use considerable amounts of cpu.  By default provide a
++ * character device skipping the whole input machinery, but with a
++ * non-standard api.. :/
++ */
++//#define INPUT_REPORTS
++#define CHARDEV_REPORTS
++
++#define MAX_CHANNELS	10
++struct generic_rx_state {
++	struct device dev;
++	struct input_dev *input;
++#ifdef CHARDEV_REPORTS
++	struct miscdevice misc;
++#endif
++	char name[10];
++	struct gpiod_desc *gpio;
++
++	uint32_t last_edge;
++
++	int ch;
++	uint8_t ch_val[MAX_CHANNELS];
++	int prev_ch_count;
++
++	uint8_t cur_data[MAX_CHANNELS];
++	int cur_data_len;
++	rwlock_t cur_data_lock;
++	wait_queue_head_t cur_data_wait;
++	int cur_data_serial;
++};
++
++struct reader_state {
++	struct generic_rx_state *rx;
++	int last_serial;
++};
++
++static void generic_rx_publish(struct generic_rx_state *state)
++{
++	int len;
++
++#ifdef INPUT_REPORTS
++	input_sync(state->input);
++#endif
++
++	len = max(state->ch, state->prev_ch_count);
++	if (!len)
++		return;
++
++	write_lock(&state->cur_data_lock);
++	state->cur_data_len = len;
++	memcpy(state->cur_data, state->ch_val, len);
++	state->cur_data_serial++;
++	write_unlock(&state->cur_data_lock);
++
++	wake_up_interruptible(&state->cur_data_wait);
++}
++
++static irqreturn_t generic_rx_handler(int irq, void *data)
++{
++	struct generic_rx_state *state = data;
++	/*
++	 * Use the monotonic timer (ktime_get).  Still need to check if
++	 * there's a time get function with less overhead, optimally
++	 * just a timer read call -- we could perhaps do just that:
++	 * find a clocksource by name or some other criteria, and call
++	 * it directly.  All we need is a 32-bit scalar, even a 16-bit
++	 * microsec value would work too.  We'd need to check if max
++	 * period and resolution are in range.
++	 */
++#define SHFT	8
++	/* The ktime_to_ns is free with CONFIG_KTIME_SCALAR */
++	volatile uint32_t now = ktime_to_ns(ktime_get()) >> SHFT;
++	uint32_t diff;
++	unsigned int diff_nat;
++	int ch = state->ch;
++	uint8_t ch_val;
++
++	diff = now - state->last_edge;
++	state->last_edge = now;
++
++	/*
++	 * The rest of this routine could really be done in a bottom
++	 * half for each channel, or done for all the channels in bulk,
++	 * but on a Linux-capable architecture, it's probably really
++	 * fast anyway.
++	 */
++
++	/* Check if delay is within the 1ms-2ms range (+/- 0.2ms) */
++	if (unlikely(diff < (800000 >> SHFT)) || diff > (2200000 >> SHFT) ||
++			unlikely((unsigned int) ch >= MAX_CHANNELS)) {
++		if (likely(diff > (3000000 >> SHFT) &&
++					diff < (16000000 >> SHFT))) {
++			state->prev_ch_count = ch;
++			state->ch = 0;
++
++			if (state->prev_ch_count && low_channels == 0)
++				generic_rx_publish(state);
++		} else if (unlikely(diff > (3000000 >> SHFT) ||
++				ch < garbage_channels)) {
++			state->prev_ch_count = 0;
++			state->ch = -1;
++		}
++
++		return IRQ_HANDLED;
++	}
++
++	diff_nat = max(min(diff, (uint32_t) 2000000 >> SHFT),
++			(uint32_t) 1000000 >> SHFT);
++	diff_nat -= 1000000 >> SHFT;
++#define MULT (uint32_t) (((1LL << (32 + SHFT)) - 1) / NSEC_PER_MSEC)
++	ch_val = (MULT * diff_nat) >> 24;
++	state->ch_val[ch++] = ch_val;
++
++#ifdef INPUT_REPORTS
++	input_report_abs(state->input, ch, ch_val);
++#endif
++
++	state->ch = ch;
++	if (ch == low_channels)
++		generic_rx_publish(state);
++
++	return IRQ_HANDLED;
++}
++
++#ifdef CHARDEV_REPORTS
++static int generic_rx_open(struct inode *inode, struct file *file)
++{
++	struct generic_rx_state *state =
++		container_of(file->private_data, struct generic_rx_state, misc);
++	struct reader_state *reader =
++		kzalloc(sizeof(struct reader_state), GFP_KERNEL);
++
++	file->private_data = reader;
++
++	reader->rx = state;
++
++	/* Make the initial read immediate unless there's no data at all */
++	reader->last_serial = 0;
++
++	return nonseekable_open(inode, file);
++}
++
++static int generic_rx_close(struct inode *inode, struct file *file)
++{
++	struct reader_state *reader = file->private_data;
++
++	file->private_data = NULL;
++	kfree(reader);
++
++	return 0;
++}
++
++static ssize_t generic_rx_read(struct file *file, char __user *ubuf,
++		size_t usize, loff_t *off)
++{
++	struct reader_state *reader = file->private_data;
++	struct generic_rx_state *state = reader->rx;
++	int err;
++
++	if (usize < MAX_CHANNELS)
++		return -EINVAL;
++
++	if (reader->last_serial == state->cur_data_serial) {
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		err = wait_event_interruptible(state->cur_data_wait,
++				reader->last_serial != state->cur_data_serial);
++		if (err)
++			return err;
++	}
++
++	read_lock_irq(&reader->rx->cur_data_lock);
++
++	err = copy_to_user(ubuf, state->cur_data, state->cur_data_len);
++	if (err)
++		err = -EINVAL;
++	else {
++		reader->last_serial = state->cur_data_serial;
++		err = state->cur_data_len;
++	}
++
++	read_unlock_irq(&state->cur_data_lock);
++
++	return err;
++}
++
++static unsigned int generic_rx_poll(struct file *file, poll_table *wait)
++{
++	struct reader_state *reader = file->private_data;
++	struct generic_rx_state *state = reader->rx;
++
++	poll_wait(file, &state->cur_data_wait, wait);
++
++	if (reader->last_serial != state->cur_data_serial)
++		return POLLIN | POLLRDNORM;
++
++	return 0;
++}
++
++static const struct file_operations generic_rx_fops = {
++	.owner		= THIS_MODULE,
++	.open		= generic_rx_open,
++	.release	= generic_rx_close,
++	.read		= generic_rx_read,
++	.poll		= generic_rx_poll,
++	.llseek		= no_llseek,
++};
++#endif
++
++static void generic_rx_free(struct device *dev)
++{
++	struct generic_rx_state *state =
++		container_of(dev, struct generic_rx_state, dev);
++
++	kfree(state);
++}
++
++static struct generic_rx_state *state;
++
++static int __init generic_rx_create(void)
++{
++	struct input_dev *input;
++	int error, flags;
++
++	flags = 0;
++	if (!strcmp(edge, "falling") || !strcmp(edge, "both"))
++		flags |= IRQF_TRIGGER_FALLING;
++	if (!strcmp(edge, "rising") || !strcmp(edge, "both"))
++		flags |= IRQF_TRIGGER_RISING;
++	if (!flags) {
++		printk("generic-rx: invalid \"edge\" parameter value\n");
++		return -EINVAL;
++	}
++
++	state = kzalloc(sizeof(struct generic_rx_state), GFP_KERNEL);
++	input = input_allocate_device();
++	if (!state || !input) {
++		error = -ENOMEM;
++		goto err_free_mem;
++	}
++
++	device_initialize(&state->dev);
++	if (dev_set_name(&state->dev, "generic-rx")) {
++		error = -ENOMEM;
++		goto err_put_dev;
++	}
++	state->dev.class = &input_class;
++	state->dev.release = generic_rx_free;
++
++	error = device_add(&state->dev);
++	if (error)
++		goto err_put_dev;
++
++	state->input = input;
++	rwlock_init(&state->cur_data_lock);
++	init_waitqueue_head(&state->cur_data_wait);
++
++	input->name = "generic-rx";
++	input->phys = "generic-rx/input0"; /* TODO: use the GPIO num */
++	input->id.bustype = BUS_HOST;
++	input->dev.parent = &state->dev;
++
++	/* Request the sum signal GPIO */
++	/*
++	 * For now we use the legacy API because it's completely unclear
++	 * how the new API should be used given an int:  first request
++	 * the GPIO using legacy gpio_request one, then convert to desc
++	 * using gpio_to_desc, then release the legacy one with gpio_free,
++	 * then keep using the desc until we call gpiod_put??
++	 *
++	 * XXX: for Rx models with no sum signal can connect to GPIOs
++	 * and we just use the same handler for all of them and should
++	 * achieve the same effect.
++	 */
++	error = gpio_request_one(gpio, GPIOF_IN, dev_name(&state->dev));
++	if (error) {
++		dev_err(&state->dev, "unable to request GPIO %i: err %i\n",
++				gpio, error);
++		goto err_del_dev;
++	}
++
++	/*
++	 * TODO: make this a "low latency" (timer-like) interrupt for things
++	 * like PREEMPT_RT.
++	 */
++	error = request_irq(gpio_to_irq(gpio), generic_rx_handler, flags,
++			"rx-sum", state);
++	if (error < 0) {
++		dev_err(&state->dev, "Failed to request IRQ: #%d: %d\n",
++				gpio_to_irq(gpio), error);
++		goto err_free_gpio;
++	}
++
++	error = input_register_device(state->input);
++	if (error) {
++		dev_err(&state->dev, "Can't register input device: %d\n",
++				error);
++		goto err_free_irq;
++	}
++
++#ifdef CHARDEV_REPORTS
++	snprintf(state->name, sizeof(state->name), "rx%i", gpio);
++	state->misc.minor = MISC_DYNAMIC_MINOR;
++	state->misc.name = state->name;
++	state->misc.fops = &generic_rx_fops;
++	error = misc_register(&state->misc);
++	if (error) {
++		dev_err(&state->dev, "Can't register char device: %d\n", error);
++		input_unregister_device(state->input);
++		goto err_free_irq;
++	}
++
++	printk("RC receiver on /dev/%s\n", state->name);
++#endif
++
++	return 0;
++
++err_free_irq:
++	free_irq(gpio_to_irq(gpio), state);
++err_free_gpio:
++	gpio_free(gpio);
++err_del_dev:
++	device_del(&state->dev);
++err_put_dev:
++	put_device(&state->dev);
++	state = NULL;
++err_free_mem:
++	input_free_device(input);
++	kfree(state);
++
++	return error;
++}
++
++static void __exit generic_rx_destroy(struct generic_rx_state *state)
++{
++	device_del(&state->dev);
++#ifdef CHARDEV_REPORTS
++	misc_deregister(&state->misc);
++#endif
++	input_unregister_device(state->input);
++	free_irq(gpio_to_irq(gpio), state);
++	gpio_free(gpio);
++	put_device(&state->dev);
++}
++
++static int __init generic_rx_init(void)
++{
++	return generic_rx_create();
++}
++
++static void __exit generic_rx_exit(void)
++{
++	generic_rx_destroy(state);
++}
++
++module_init(generic_rx_init);
++module_exit(generic_rx_exit);
++
++MODULE_DESCRIPTION("RC-hobbies receiver driver");
++MODULE_AUTHOR("Andrzej Zaborowski <andrew.zaborowski@intel.com>");
++MODULE_LICENSE("GPL");
+-- 
+1.8.1.2
+

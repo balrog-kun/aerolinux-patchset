@@ -1,0 +1,163 @@
+From 9b46713493f57f1a3da356648842a9e4aca1526b Mon Sep 17 00:00:00 2001
+From: Andrzej Zaborowski <andrew.zaborowski@intel.com>
+Date: Wed, 14 May 2014 09:16:29 +0200
+Subject: [PATCH] imx23: High-res clocksource using 16-bit Timer 1.
+
+This add a 3MHz clocksource that can be selected by userspace if needed
+instead of the default 32kHz clocksource (Timer 2).  This comes at the
+cost of more frequent wakeups.
+
+Signed-off-by: Andrzej Zaborowski <andrew.zaborowski@intel.com>
+---
+ arch/arm/boot/dts/imx23.dtsi    |  2 +-
+ drivers/clocksource/mxs_timer.c | 59 +++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm/boot/dts/imx23.dtsi b/arch/arm/boot/dts/imx23.dtsi
+index b9d63c5..e97bf37 100644
+--- a/arch/arm/boot/dts/imx23.dtsi
++++ b/arch/arm/boot/dts/imx23.dtsi
+@@ -507,7 +507,7 @@
+ 				compatible = "fsl,imx23-timrot", "fsl,timrot";
+ 				reg = <0x80068000 0x2000>;
+ 				interrupts = <28 29 30 31>;
+-				clocks = <&clks 28>;
++				clocks = <&clks 28>, <&clks 16>;
+ 			};
+ 
+ 			auart0: serial@8006c000 {
+diff --git a/drivers/clocksource/mxs_timer.c b/drivers/clocksource/mxs_timer.c
+index 445b68a..f9eb260 100644
+--- a/drivers/clocksource/mxs_timer.c
++++ b/drivers/clocksource/mxs_timer.c
+@@ -67,12 +67,21 @@
+ #define HW_TIMROT_RUNNING_COUNTn(n)	(0x30 + (n) * 0x40)
+ #define HW_TIMROT_FIXED_COUNTn(n)	(0x40 + (n) * 0x40)
+ 
++/*
++ * On MX23 we also add a high-resolution clocksource using timer 1,
++ * so we need separate macros to access its registers.
++ */
++#define HW_TIMROTv1_TIMCTRLn(n)		(0x20 + (n) * 0x20)
++#define HW_TIMROTv1_TIMCOUNTn(n)	(0x30 + (n) * 0x20)
++
+ #define BM_TIMROT_TIMCTRLn_RELOAD	(1 << 6)
+ #define BM_TIMROT_TIMCTRLn_UPDATE	(1 << 7)
+ #define BM_TIMROT_TIMCTRLn_IRQ_EN	(1 << 14)
+ #define BM_TIMROT_TIMCTRLn_IRQ		(1 << 15)
+ #define BP_TIMROT_TIMCTRLn_SELECT	0
++#define BV_TIMROT_TIMCTRLn_PRESCALE__DIV_BY_8		(3 << 4)
+ #define BV_TIMROTv1_TIMCTRLn_SELECT__32KHZ_XTAL		0x8
++#define BV_TIMROTv1_TIMCTRLn_SELECT__TICK_ALWAYS	0xc
+ #define BV_TIMROTv2_TIMCTRLn_SELECT__32KHZ_XTAL		0xb
+ #define BV_TIMROTv2_TIMCTRLn_SELECT__TICK_ALWAYS	0xf
+ 
+@@ -102,8 +111,12 @@ static void timrot_irq_acknowledge(void)
+ 
+ static cycle_t timrotv1_get_cycles(struct clocksource *cs)
+ {
+-	return ~((__raw_readl(mxs_timrot_base + HW_TIMROT_TIMCOUNTn(1))
+-			& 0xffff0000) >> 16);
++	return (~__raw_readl(mxs_timrot_base + HW_TIMROTv1_TIMCOUNTn(2))) >> 16;
++}
++
++static cycle_t timrotv1_get_cycles_hres(struct clocksource *cs)
++{
++	return (~__raw_readl(mxs_timrot_base + HW_TIMROTv1_TIMCOUNTn(1))) >> 16;
+ }
+ 
+ static int timrotv1_set_next_event(unsigned long evt,
+@@ -222,12 +235,29 @@ static struct clocksource clocksource_mxs = {
+ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+ };
+ 
++/*
++ * As a 16-bit timer running at 3MHz it will force the system to never sleep
++ * for more than ~21ms at a time for timekeeping to be possible.  This makes
++ * it less fit for general energy-efficient use, even though it's just fine
++ * for applications where frequent wakeups are necessary anyway.  Thus we
++ * set the rating lower than 200 but let userspace switch to this
++ * clocksource when needed.
++ */
++static struct clocksource clocksource_mxs_hres = {
++	.name		= "mxs_timer_hres",
++	.rating		= 195,
++	.read		= timrotv1_get_cycles_hres,
++	.mask		= CLOCKSOURCE_MASK(16),
++	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
++};
++
+ static u64 notrace mxs_read_sched_clock_v2(void)
+ {
+ 	return ~readl_relaxed(mxs_timrot_base + HW_TIMROT_RUNNING_COUNTn(1));
+ }
+ 
+-static int __init mxs_clocksource_init(struct clk *timer_clk)
++static int __init mxs_clocksource_init(struct clk *timer_clk,
++		struct clk *timer_clk_hres)
+ {
+ 	unsigned int c = clk_get_rate(timer_clk);
+ 
+@@ -239,12 +269,17 @@ static int __init mxs_clocksource_init(struct clk *timer_clk)
+ 		sched_clock_register(mxs_read_sched_clock_v2, 32, c);
+ 	}
+ 
++	if (!IS_ERR(timer_clk_hres)) {
++		c = clk_get_rate(timer_clk_hres) / 8;
++		clocksource_register_hz(&clocksource_mxs_hres, c);
++	}
++
+ 	return 0;
+ }
+ 
+ static void __init mxs_timer_init(struct device_node *np)
+ {
+-	struct clk *timer_clk;
++	struct clk *timer_clk, *timer_clk_hres;
+ 	int irq;
+ 
+ 	mxs_timrot_base = of_iomap(np, 0);
+@@ -255,8 +290,12 @@ static void __init mxs_timer_init(struct device_node *np)
+ 		pr_err("%s: failed to get clk\n", __func__);
+ 		return;
+ 	}
++	/* Get the high res clk if available */
++	timer_clk_hres = of_clk_get(np, 1);
+ 
+ 	clk_prepare_enable(timer_clk);
++	if (!IS_ERR(timer_clk_hres))
++		clk_prepare_enable(timer_clk_hres);
+ 
+ 	/*
+ 	 * Initialize timers to a known state
+@@ -285,6 +324,13 @@ static void __init mxs_timer_init(struct device_node *np)
+ 			BM_TIMROT_TIMCTRLn_RELOAD,
+ 			mxs_timrot_base + HW_TIMROT_TIMCTRLn(1));
+ 
++	/* another for the hres clocksource */
++	if (!IS_ERR(timer_clk_hres))
++		__raw_writel(BV_TIMROTv1_TIMCTRLn_SELECT__TICK_ALWAYS |
++				BV_TIMROT_TIMCTRLn_PRESCALE__DIV_BY_8 |
++				BM_TIMROT_TIMCTRLn_RELOAD,
++				mxs_timrot_base + HW_TIMROTv1_TIMCTRLn(1));
++
+ 	/* set clocksource timer fixed count to the maximum */
+ 	if (timrot_is_v1())
+ 		__raw_writel(0xffff,
+@@ -292,9 +338,12 @@ static void __init mxs_timer_init(struct device_node *np)
+ 	else
+ 		__raw_writel(0xffffffff,
+ 			mxs_timrot_base + HW_TIMROT_FIXED_COUNTn(1));
++	if (!IS_ERR(timer_clk_hres))
++		__raw_writel(0xffff,
++			mxs_timrot_base + HW_TIMROTv1_TIMCOUNTn(1));
+ 
+ 	/* init and register the timer to the framework */
+-	mxs_clocksource_init(timer_clk);
++	mxs_clocksource_init(timer_clk, timer_clk_hres);
+ 	mxs_clockevent_init(timer_clk);
+ 
+ 	/* Make irqs happen */
+-- 
+1.8.1.2
+
